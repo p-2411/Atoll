@@ -1397,7 +1397,9 @@ extension Defaults.Keys {
     static let enableShortcuts = Key<Bool>("enableShortcuts", default: true)
     
     // MARK: System HUD Feature
-    static let enableSystemHUD = Key<Bool>("enableSystemHUD", default: true)
+    // Off by default: replacing the system HUD means swallowing the volume and
+    // brightness keys and freezing macOS's own OSD. Opt in from Settings.
+    static let enableSystemHUD = Key<Bool>("enableSystemHUD", default: false)
     static let enableVolumeHUD = Key<Bool>("enableVolumeHUD", default: true)
     static let enableBrightnessHUD = Key<Bool>("enableBrightnessHUD", default: true)
     static let enableKeyboardBacklightHUD = Key<Bool>("enableKeyboardBacklightHUD", default: true)
