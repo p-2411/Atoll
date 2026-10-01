@@ -35,6 +35,16 @@ import UIKit
 #endif
 
 @MainActor
+/// A full-height strip `width` wide, centred horizontally.
+private struct CentredStripShape: Shape {
+    var width: CGFloat
+
+    func path(in rect: CGRect) -> Path {
+        let stripWidth = min(max(width, 0), rect.width)
+        return Path(CGRect(x: rect.midX - stripWidth / 2, y: rect.minY, width: stripWidth, height: rect.height))
+    }
+}
+
 struct ContentView: View {
     @Default(.pinnedLyricContext) private var pinnedLyricContext
     @Default(.pinLyricsWhenClosed) private var pinLyricsWhenClosed
@@ -54,10 +64,12 @@ struct ContentView: View {
     @ObservedObject var lockScreenManager = LockScreenManager.shared
     @ObservedObject private var networkConnectivityManager = NetworkConnectivityManager.shared
     @ObservedObject private var menuBarLayout = MenuBarLayout.shared
-    /// Width of the closed-notch content, measured so its left edge can be
-    /// compared against the frontmost app's menus. Only the *size* is read --
-    /// the offset that follows does not change it, so there is no feedback.
+    /// Width of the closed-notch content, measured so its edges can be compared
+    /// against what else is in the menu bar. Clearing the menu bar only masks
+    /// the surface, so the content keeps its width and there is no feedback.
     @State private var closedContentWidth: CGFloat = 0
+    /// Whether this view holds one of `MenuBarLayout`'s tracking references.
+    @State private var isTrackingMenuBar = false
     @ObservedObject var capsLockManager = CapsLockManager.shared
     @ObservedObject var extensionLiveActivityManager = ExtensionLiveActivityManager.shared
     @ObservedObject var extensionNotchExperienceManager = ExtensionNotchExperienceManager.shared
@@ -662,6 +674,16 @@ struct ContentView: View {
             .padding([.horizontal, .bottom], vm.notchState == .open ? 12 : 0)
             .background(.black)
             .clipShape(resolvedClipShape)
+            // While a live activity would cover the menu bar, draw only the bare
+            // notch. The masked strip is transparent, so clicks reach the menus.
+            .mask(alignment: .top) {
+                Rectangle()
+                    .frame(
+                        width: isClearingMenuBar ? restingClosedSurfaceWidth : nil,
+                        height: isClearingMenuBar ? vm.effectiveClosedNotchHeight : nil
+                    )
+            }
+            .animation(.smooth(duration: 0.25), value: isClearingMenuBar)
             // Keep the anti-gap fill outside the clipped notch. The window sits
             // this far above screen.maxY, so placing the spacer after clipShape
             // leaves the notch's top corners anchored to the visible screen edge.
@@ -711,7 +733,10 @@ struct ContentView: View {
             }
             .conditionalModifier(interactionsEnabled) { view in
                 view
-                    .contentShape(resolvedClipShape)
+                    // Masked-away wings must not catch hovers meant for the menu bar.
+                    .contentShape(isClearingMenuBar
+                        ? AnyShape(CentredStripShape(width: restingClosedSurfaceWidth))
+                        : resolvedClipShape)
                     .onHover { hovering in
                         handleHover(hovering)
                     }
@@ -1007,15 +1032,19 @@ struct ContentView: View {
                 }
             }
             .onAppear {
-                if vm.notchState == .closed { menuBarLayout.startTracking() }
+                syncMenuBarTracking()
             }
-            .onChange(of: vm.notchState) { _, state in
-                // An open notch covers the menu bar wholesale and is the user's
-                // own doing, so there is nothing to step around while it is up.
-                if state == .closed {
-                    menuBarLayout.startTracking()
+            // An open notch covers the menu bar wholesale and is the user's own
+            // doing, so there is nothing to step around while it is up.
+            .onChange(of: closedSurfaceHasWings) { _, _ in
+                syncMenuBarTracking()
+            }
+            .onChange(of: isClearingMenuBar) { _, clearing in
+                if clearing {
+                    cancelMusicControlWindowSync()
+                    hideMusicControlWindow()
                 } else {
-                    menuBarLayout.stopTracking()
+                    enqueueMusicControlWindowSync(forceRefresh: true, delay: 0.05)
                 }
             }
             .onDisappear {
@@ -1023,32 +1052,56 @@ struct ContentView: View {
             }
     }
 
-    /// How far right the closed-notch content has to move so it stops covering
-    /// the frontmost app's menus.
-    ///
-    /// A live activity's left wing draws into the strip of menu bar beside the
-    /// notch, which is where the app's own menus live. macOS lays those out
-    /// against `NSScreen.auxiliaryTopLeftArea` and there is no way to tell it
-    /// some of that strip is spoken for -- both auxiliary areas are read-only.
-    /// So the content moves instead of the menus.
-    ///
-    /// Zero unless something is actually being covered: no live activity, an
-    /// open notch, no accessibility permission, or menus that end before the
-    /// content begins all leave the notch centred where it belongs.
-    private var menuBarClearanceOffset: CGFloat {
-        guard vm.notchState == .closed,
-              !vm.hideOnClosed,
-              closedContentWidth > 0,
-              let menusRightEdge = menuBarLayout.appMenusRightEdge,
-              let screenFrame = getScreenFrame(currentScreenName)
-        else { return 0 }
+    /// Width of the closed surface with no live activity in it: the bare notch.
+    private var restingClosedSurfaceWidth: CGFloat {
+        vm.closedNotchSize.width - 20 + notchHorizontalPadding * 2
+    }
 
-        return MenuBarLayout.clearanceOffset(
-            contentWidth: closedContentWidth,
+    /// Whether the closed surface currently reaches past the bare notch into
+    /// the menu bar, i.e. a live activity has wings.
+    private var closedSurfaceHasWings: Bool {
+        vm.notchState == .closed
+            && !vm.hideOnClosed
+            && !isIslandMode
+            && !isConnectivityHUDVisible
+            && closedContentWidth + notchHorizontalPadding * 2 > restingClosedSurfaceWidth + 1
+    }
+
+    /// Whether a live activity's wings would cover the frontmost app's menus or
+    /// status items, so only the bare notch should be drawn.
+    ///
+    /// The wings draw into the strip of menu bar beside the notch, and macOS
+    /// offers no way to reserve it. Sliding the island sideways does not work
+    /// either: on a notched Mac the surface cannot leave the camera housing. So
+    /// the wings are masked away until there is room, which also makes that
+    /// strip of the window transparent and lets clicks through to the menu bar.
+    ///
+    /// The comparison uses the content's own width, which masking leaves alone,
+    /// so hiding the wings cannot be what makes them fit again.
+    private var isClearingMenuBar: Bool {
+        guard closedSurfaceHasWings,
+              let screenFrame = getScreenFrame(currentScreenName)
+        else { return false }
+
+        return MenuBarLayout.surfaceCollides(
+            surfaceWidth: closedContentWidth + notchHorizontalPadding * 2,
             screenFrame: screenFrame,
-            menusRightEdge: menusRightEdge,
+            obstacles: menuBarLayout.obstacles,
             gap: MenuBarLayout.clearanceGap
         )
+    }
+
+    /// Measuring the menu bar means asking other processes, so it only happens
+    /// while there are wings that could cover something.
+    private func syncMenuBarTracking() {
+        let shouldTrack = closedSurfaceHasWings
+        guard shouldTrack != isTrackingMenuBar else { return }
+        isTrackingMenuBar = shouldTrack
+        if shouldTrack {
+            menuBarLayout.startTracking()
+        } else {
+            menuBarLayout.stopTracking()
+        }
     }
 
     @ViewBuilder
@@ -1274,12 +1327,6 @@ struct ContentView: View {
               }
               .pinnedLyrics(isVisible: pinnedLyricsVisible,
                   isContentHidden: isSneakPeekVisibleOnCurrentScreen || isConnectivityHUDVisible)
-              // A connectivity HUD must remain centred on the physical notch:
-              // its middle transparent lane is what keeps both wings visible.
-              // Menu-bar clearance would shift that lane underneath the camera
-              // housing and clip one of the two content areas.
-              .offset(x: isConnectivityHUDVisible ? 0 : menuBarClearanceOffset)
-              .animation(.smooth(duration: 0.25), value: menuBarClearanceOffset)
               .zIndex(2)
               
               ZStack {
@@ -2135,11 +2182,8 @@ struct ContentView: View {
         let activationWidth = vm.closedNotchSize.width + horizontalPadding * 2
         let activationHeight = max(vm.closedNotchSize.height + zeroHeightHoverPadding, 14)
 
-        // Follows the rendered content: when a live activity has stepped aside
-         // from the menus, activating at the old centre would arm the notch where
-         // nothing is drawn and refuse the pointer where it is.
         let activationRect = CGRect(
-            x: screen.frame.midX - activationWidth / 2 + menuBarClearanceOffset,
+            x: screen.frame.midX - activationWidth / 2,
             y: screen.frame.maxY - activationHeight,
             width: activationWidth,
             height: activationHeight
@@ -2151,7 +2195,10 @@ struct ContentView: View {
     /// Cancels every long-lived task / event monitor this view owns. Called from
     /// `.onDisappear` and from `vm.onViewTeardown` on window close. Idempotent.
     private func performViewTeardown() {
-        menuBarLayout.stopTracking()
+        if isTrackingMenuBar {
+            isTrackingMenuBar = false
+            menuBarLayout.stopTracking()
+        }
         hoverTask?.cancel()
         stopHoverClickMonitor()
         removeStickyTerminalClickMonitor()
@@ -2419,8 +2466,7 @@ struct ContentView: View {
             + PinnedLyricsView.reservedHeight(isEligible: pinnedLyricsVisible,
                 availability: musicManager.lyricsAvailability, context: pinnedLyricContext)
         let width = max(closedWidth, recordingSize?.width ?? 0) + 24
-        // Same shift the content is drawn with, so the hit area stays under it.
-        let minX = screen.frame.midX - width / 2 + menuBarClearanceOffset
+        let minX = screen.frame.midX - width / 2
         let minY = screen.frame.maxY - height
 
         return location.x >= minX && location.x <= minX + width
@@ -2451,7 +2497,7 @@ struct ContentView: View {
         PinnedLyricsView.shouldReserve(
             lyricsEnabled: enableLyrics,
             pinEnabled: pinLyricsWhenClosed,
-            surfaceEligible: vm.notchState == .closed && !vm.hideOnClosed
+            surfaceEligible: vm.notchState == .closed && !vm.hideOnClosed && !isClearingMenuBar
                 && !lockScreenManager.isLocked && musicManager.isPlaying,
             availability: musicManager.lyricsAvailability
         )
@@ -2848,6 +2894,7 @@ struct ContentView: View {
               standardMediaControlsActive,
               vm.notchState == .closed,
               !vm.hideOnClosed,
+              !isClearingMenuBar,
               !lockScreenManager.isLocked,
               !isMusicHUDDeferredAfterUnlock,
               !isMusicControlWindowSuppressed else {
